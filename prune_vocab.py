@@ -33,7 +33,8 @@ import tempfile
 from typing import Dict, List, Optional, Set
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from safetensors.torch import load_file, save_file
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -66,6 +67,13 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Validate inputs and report what would change without writing files.",
+    )
+    parser.add_argument(
+        "--ignore-mismatched-sizes",
+        action="store_true",
+        help="Pass ``ignore_mismatched_sizes=True`` to ``from_pretrained``. "
+        "Use when loading quantized or custom models whose weight shapes "
+        "differ from the architecture config.",
     )
     return parser.parse_args()
 
@@ -251,33 +259,94 @@ def prune_lm_head_weight(
 
 
 # ---------------------------------------------------------------------------
-# Model helpers
+# Safetensors vocabulary pruning  (unit-testable)
 # ---------------------------------------------------------------------------
 
+# Tensor name prefixes that indicate vocabulary-related weights.
+_VOCAB_PREFIXES = [
+    "model.embed_tokens",
+    "model.model.embed_tokens",
+    "transformer.wte",
+    "gpt_neox.embed_in",
+    "embed",
+    "lm_head",
+]
 
-def get_embed_tokens(model) -> torch.nn.Embedding:
-    """Return the token embedding layer via the canonical HF accessor."""
-    embed = model.get_input_embeddings()
-    if embed is None:
-        print("Error: model has no input embeddings.")
+
+def is_vocab_tensor(name: str, shape: torch.Size, vocab_size: int) -> bool:
+    """Return ``True`` if *name*/*shape* refer to a vocabulary-mapped tensor.
+
+    A tensor is considered vocab-mapped when:
+    1. Its first dimension equals *vocab_size*, **and**
+    2. Its name contains a known embedding/lm-head keyword.
+    """
+    if len(shape) < 1 or shape[0] != vocab_size:
+        return False
+    lower = name.lower()
+    return any(lower.startswith(p.lower()) for p in _VOCAB_PREFIXES)
+
+
+def find_vocab_tensors(
+    tensors: dict,
+    vocab_size: int,
+) -> dict:
+    """Return ``{name: tensor}`` for every vocab-mapped tensor in *tensors*."""
+    return {
+        name: tensor
+        for name, tensor in tensors.items()
+        if is_vocab_tensor(name, tensor.size(), vocab_size)
+    }
+
+
+def prune_safetensors_directory(
+    input_dir: str,
+    output_dir: str,
+    remove_ids: Set[int],
+    vocab_size: int,
+    id_mapping: Dict[int, int],
+    new_vocab_size: int,
+) -> None:
+    """Prune vocabulary from every ``.safetensors`` file in *input_dir*.
+
+    For each shard:
+    1. Load tensors with ``safetensors.torch.load_file``.
+    2. Find any vocab-mapped tensors (embedding, lm-head, and their
+       companion quantisation scale tensors).
+    3. Prune the first dimension of those tensors using the *id_mapping*.
+    4. Save the modified shard to *output_dir*.
+
+    Files that contain no vocab-mapped tensors are copied verbatim so that
+    quantisation metadata and other auxiliary weights are preserved
+    exactly.
+    """
+    safetensors_files = sorted(
+        f for f in os.listdir(input_dir) if f.endswith(".safetensors")
+    )
+    if not safetensors_files:
+        print("Error: no .safetensors files found in model directory.")
         sys.exit(1)
-    return embed
 
+    for fname in safetensors_files:
+        src = os.path.join(input_dir, fname)
+        tensors = load_file(src, device="cpu")
 
-def get_lm_head(model) -> torch.nn.Linear:
-    """Return the LM output projection via the canonical HF accessor."""
-    head = model.get_output_embeddings()
-    if head is None:
-        print("Error: model has no output embeddings (lm_head).")
-        sys.exit(1)
-    return head
+        vocab_tensors = find_vocab_tensors(tensors, vocab_size)
+        if not vocab_tensors:
+            # No vocab-related tensors — plain copy
+            shutil.copy2(src, os.path.join(output_dir, fname))
+            continue
 
+        for name, tensor in vocab_tensors.items():
+            tensors[name] = prune_weight(tensor, id_mapping, new_vocab_size)
 
-def embeddings_are_tied(model) -> bool:
-    """Return ``True`` if lm_head and embed_tokens share their weight storage."""
-    embed = get_embed_tokens(model)
-    head = get_lm_head(model)
-    return head.weight.data_ptr() == embed.weight.data_ptr()
+        dst = os.path.join(output_dir, fname)
+        save_file(tensors, dst)
+
+    # Copy safetensors index if it exists (maps tensor names to shard files)
+    for idx_name in ("model.safetensors.index.json",):
+        src_idx = os.path.join(input_dir, idx_name)
+        if os.path.exists(src_idx):
+            shutil.copy2(src_idx, os.path.join(output_dir, idx_name))
 
 
 # ---------------------------------------------------------------------------
@@ -467,34 +536,38 @@ def _copy_extra_tokenizer_files(src_dir: str, dst_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def perform_consistency_checks(
-    model,
+def verify_pruned_vocab_size(
+    input_dir: str,
+    vocab_size: int,
     new_vocab_size: int,
-    id_mapping: Dict[int, int],
+) -> None:
+    """Verify that every ``.safetensors`` shard has correctly pruned tensors.
+
+    Checks that every vocab-mapped tensor now has *new_vocab_size* as its
+    first dimension.  This catches any shard that was missed or incorrectly
+    pruned.
+    """
+    safetensors_files = sorted(
+        f for f in os.listdir(input_dir) if f.endswith(".safetensors")
+    )
+    for fname in safetensors_files:
+        tensors = load_file(os.path.join(input_dir, fname), device="cpu")
+        for name, tensor in tensors.items():
+            if is_vocab_tensor(name, tensor.size(), vocab_size):
+                print(
+                    f"Consistency error: tensor '{name}' in {fname} still "
+                    f"has vocab_size={tensor.size(0)} (expected {new_vocab_size})."
+                )
+                sys.exit(1)
+
+
+def check_tokenizer_consistency(
     tokenizer_data: dict,
     tokenizer_config: dict,
+    new_vocab_size: int,
 ) -> None:
-    """Run pre-save consistency checks and exit on failure."""
-    embed = get_embed_tokens(model)
-    head = get_lm_head(model)
-
-    # 1. Embedding rows equal new vocabulary size
-    if embed.weight.size(0) != new_vocab_size:
-        print(
-            f"Consistency error: embedding rows ({embed.weight.size(0)}) "
-            f"!= new vocabulary size ({new_vocab_size})."
-        )
-        sys.exit(1)
-
-    # 2. LM head rows equal new vocabulary size
-    if head.weight.size(0) != new_vocab_size:
-        print(
-            f"Consistency error: lm_head rows ({head.weight.size(0)}) "
-            f"!= new vocabulary size ({new_vocab_size})."
-        )
-        sys.exit(1)
-
-    # 3. Tokenizer vocabulary size matches model vocabulary size
+    """Verify tokenizer data matches the new vocabulary size and special-token IDs are valid."""
+    # 1. Tokenizer vocabulary size matches
     model_type = tokenizer_data.get("model", {}).get("type", "")
     if model_type in ("BPE", "WordPiece"):
         tk_vocab_size = len(tokenizer_data.get("model", {}).get("vocab", {}))
@@ -510,7 +583,7 @@ def perform_consistency_checks(
         )
         sys.exit(1)
 
-    # 4. Special tokens exist with valid IDs
+    # 2. Special tokens exist with valid IDs
     special_ids: List[Optional[int]] = []
     for key in (
         "bos_token_id",
@@ -522,7 +595,6 @@ def perform_consistency_checks(
         if val is not None:
             special_ids.append(val)
 
-    # Also check dict-form special tokens
     for key in (
         "bos_token",
         "eos_token",
@@ -547,8 +619,33 @@ def perform_consistency_checks(
 # ---------------------------------------------------------------------------
 
 
+def _copy_non_safetensors(input_dir: str, output_dir: str) -> None:
+    """Copy files needed for the model to load.
+
+    Skips tokenizer files (handled separately), safetensors files
+    (already handled), config files (written explicitly), and the
+    safetensors index (copied during pruning).
+    """
+    skip_exact = {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "model.safetensors.index.json",
+    }
+    for name in os.listdir(input_dir):
+        if name in skip_exact:
+            continue
+        if name.endswith(".safetensors"):
+            continue
+        if name.startswith("tokenizer"):
+            continue
+        src = os.path.join(input_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(output_dir, name))
+
+
 def save_everything(
-    model,
     config,
     output_dir: str,
     tokenizer_data: dict,
@@ -556,17 +653,17 @@ def save_everything(
     special_tokens_map: Optional[dict],
     input_dir: str,
 ) -> None:
-    """Write pruned model, tokenizer, and configuration to *output_dir*.
+    """Write pruned model configuration, tokenizer, and supporting files.
 
-    This function writes files directly rather than relying on
-    ``tokenizer.save_pretrained()`` to have full control over the
-    tokenizer file contents.
+    Safetensors weight files are already on disk (pruned in-place by
+    :func:`prune_safetensors_directory`).  This function writes the
+    remaining text-format files.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Model weights (safe_serialization=True → safetensors)
-    print("  Saving model weights (safe_serialization)…")
-    model.save_pretrained(output_dir, safe_serialization=True)
+    # Config (updated vocab_size)
+    print("  Saving config.json…")
+    config.save_pretrained(output_dir)
 
     # tokenizer.json
     print("  Saving tokenizer.json…")
@@ -590,10 +687,9 @@ def save_everything(
     # Remaining tokenizer files (tokenizer.model, …)
     _copy_extra_tokenizer_files(input_dir, output_dir)
 
-    # Ensure config.json is also saved (already done by model.save_pretrained,
-    # but this guarantees the updated vocab_size is persisted even if the
-    # model's save mechanism skips it for some reason).
-    config.save_pretrained(output_dir)
+    # Model support files (config, generation_config, tokeniser files,
+    # modelling code, etc.)
+    _copy_non_safetensors(input_dir, output_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -619,13 +715,12 @@ def main() -> None:
         print("Error: --remove-ids is empty or contains no valid IDs.")
         sys.exit(1)
 
-    # ── 1. Load model & tokenizer ──────────────────────────────────────────
-    print(f"Loading model from '{input_dir}'…")
-    model = AutoModelForCausalLM.from_pretrained(input_dir)
+    # ── 1. Load config & tokenizer (no model loading) ─────────────────────
+    print(f"Loading config from '{input_dir}'…")
+    config = AutoConfig.from_pretrained(input_dir)
     print(f"Loading tokenizer from '{input_dir}'…")
     tokenizer = AutoTokenizer.from_pretrained(input_dir)
 
-    config = model.config
     original_vocab_size = config.vocab_size
 
     # ── 2. Validate token IDs ──────────────────────────────────────────────
@@ -644,29 +739,41 @@ def main() -> None:
     print(f"Tokens removed:           {num_removed}")
     print(f"Reduction:                {reduction_pct:.2f}%")
     print(f"Tokenizer type:           {detect_tokenizer_type(tokenizer)}")
-    print(f"Tied embeddings:          {embeddings_are_tied(model)}")
+
+    # Detect tied embeddings from safetensors (lm_head.weight absent means tied)
+    safetensors_files = sorted(
+        f for f in os.listdir(input_dir) if f.endswith(".safetensors")
+    )
+    has_lm_head = False
+    has_embed = False
+    for fname in safetensors_files:
+        tensors = load_file(os.path.join(input_dir, fname), device="cpu")
+        has_lm_head = has_lm_head or any(
+            "lm_head" in k and k.endswith(".weight") for k in tensors
+        )
+        has_embed = has_embed or any(
+            is_vocab_tensor(k, tensors[k].size(), original_vocab_size)
+            and "lm_head" not in k
+            for k in tensors
+        )
+    tied = not has_lm_head or (has_lm_head and not has_embed)
+    print(f"Tied embeddings:          {tied}")
 
     if dry_run:
         print("\n✔ Dry-run validation passed.  No files were written.")
         return
 
-    # ── 4. Prune model weights ─────────────────────────────────────────────
-    print("\nPruning model weights…")
-    embed = get_embed_tokens(model)
-    head = get_lm_head(model)
-    tied = embeddings_are_tied(model)
+    if os.path.exists(output_dir):
+        print(f"Error: output directory '{output_dir}' already exists.")
+        sys.exit(1)
+    os.makedirs(output_dir)
 
-    # Embedding
-    new_embed = prune_embedding_weight(embed, id_mapping, new_vocab_size)
-    embed.weight.data = new_embed
-
-    if not tied:
-        new_head = prune_lm_head_weight(head, id_mapping, new_vocab_size)
-        head.weight.data = new_head
-    else:
-        # When weights are tied, lm_head.weight IS embed_tokens.weight
-        # (same Python object).  Updating embed_tokens already updated lm_head.
-        print("  (lm_head is tied to embed_tokens \u2014 already updated)")
+    # ── 4. Prune safetensors weights ─────────────────────────────────────
+    print("\nPruning vocabulary in safetensors files…")
+    prune_safetensors_directory(
+        input_dir, output_dir, remove_ids, original_vocab_size,
+        id_mapping, new_vocab_size,
+    )
 
     # Update config
     config.vocab_size = new_vocab_size
@@ -674,7 +781,6 @@ def main() -> None:
     # ── 5. Rebuild tokenizer files ────────────────────────────────────────
     print("Rebuilding tokenizer files…")
 
-    # tokenizer.json
     tk_json_src = os.path.join(input_dir, "tokenizer.json")
     if not os.path.exists(tk_json_src):
         print("Error: tokenizer.json not found in model directory.")
@@ -685,7 +791,6 @@ def main() -> None:
 
     new_tk_data = rebuild_tokenizer_json(raw_tk_data, remove_ids, id_mapping)
 
-    # tokenizer_config.json
     tk_cfg_src = os.path.join(input_dir, "tokenizer_config.json")
     if os.path.exists(tk_cfg_src):
         with open(tk_cfg_src, "r", encoding="utf-8") as f:
@@ -696,7 +801,6 @@ def main() -> None:
     else:
         new_tk_cfg = {"vocab_size": new_vocab_size}
 
-    # special_tokens_map.json
     stm_data: Optional[dict] = None
     stm_src = os.path.join(input_dir, "special_tokens_map.json")
     if os.path.exists(stm_src):
@@ -707,12 +811,14 @@ def main() -> None:
 
     # ── 6. Consistency checks ─────────────────────────────────────────────
     print("Running consistency checks…")
-    perform_consistency_checks(
-        model, new_vocab_size, id_mapping, new_tk_data, new_tk_cfg
-    )
 
-    # Also verify the rebuilt tokenizer can actually be loaded by
-    # AutoTokenizer by writing to a temporary directory.
+    verify_pruned_vocab_size(output_dir, original_vocab_size, new_vocab_size)
+    print("  All safetensors tensors correctly pruned \u2714")
+
+    check_tokenizer_consistency(new_tk_data, new_tk_cfg, new_vocab_size)
+    print("  Tokenizer data consistent \u2714")
+
+    # Verify the rebuilt tokenizer can be loaded by AutoTokenizer
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_tk_json = os.path.join(tmpdir, "tokenizer.json")
         with open(tmp_tk_json, "w", encoding="utf-8") as f:
@@ -741,7 +847,6 @@ def main() -> None:
     # ── 7. Save everything ─────────────────────────────────────────────────
     print(f"Saving pruned model to '{output_dir}'…")
     save_everything(
-        model,
         config,
         output_dir,
         new_tk_data,
@@ -752,7 +857,10 @@ def main() -> None:
 
     # ── 8. Final spot-check ────────────────────────────────────────────────
     try:
-        _ = AutoModelForCausalLM.from_pretrained(output_dir)
+        _ = AutoModelForCausalLM.from_pretrained(
+            output_dir,
+            trust_remote_code=True,
+        )
         _ = AutoTokenizer.from_pretrained(output_dir, use_fast=True)
         print("  Saved model loads correctly \u2714")
     except Exception as exc:

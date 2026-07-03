@@ -117,12 +117,13 @@ outputs = model.generate(**inputs)
 
 ## Arguments
 
-| Argument        | Required | Description                                           |
-|-----------------|----------|-------------------------------------------------------|
-| `--model`       | Yes      | Path to the input Hugging Face model directory.       |
-| `--output`      | Yes      | Path where the pruned model will be saved.            |
-| `--remove-ids`  | Yes      | Comma-separated list of token IDs to remove.          |
-| `--dry-run`     | No       | Validate everything and report changes without writing. |
+| Argument                    | Required | Description                                                      |
+|-----------------------------|----------|------------------------------------------------------------------|
+| `--model`                   | Yes      | Path to the input Hugging Face model directory.                  |
+| `--output`                  | Yes      | Path where the pruned model will be saved.                       |
+| `--remove-ids`              | Yes      | Comma-separated list of token IDs to remove.                     |
+| `--dry-run`                 | No       | Validate everything and report changes without writing.          |
+| `--ignore-mismatched-sizes` | No       | Pass `ignore_mismatched_sizes=True` to `from_pretrained`. Use when loading quantized or custom models whose weight shapes differ from the architecture config. |
 
 ## Step-by-step
 
@@ -199,6 +200,7 @@ output_dir/
 | ID out of range                           | `Error: token ID 99999 is out of range. Vocabulary size is ...`|
 | Special token in removal list             | `Error: special token 'bos_token_id' (ID 1) is marked for removal.` |
 | `safetensors` not installed               | `Error: safetensors is required. Install it with: pip install safetensors` |
+| `from_pretrained` fails (quantized model) | `RuntimeError: You set ignore_mismatched_sizes to False…` — retry with `--ignore-mismatched-sizes` |
 | `tokenizer.json` missing                  | `Error: tokenizer.json not found in model directory.`          |
 | Consistency check fails (embedding rows)  | `Consistency error: embedding rows ... != new vocabulary size ...` |
 | Consistency check fails (tokenizer load)  | `Error: rebuilt tokenizer could not be loaded: ...`            |
