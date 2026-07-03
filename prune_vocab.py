@@ -693,6 +693,60 @@ def save_everything(
 
 
 # ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+
+def get_vocab_size(config) -> int:
+    """
+    Extract vocabulary size from various config types.
+
+    Handles standard configs (vocab_size), MoE configs (text_config.vocab_size),
+    and encoder-decoder configs (decoder.vocab_size or encoder.vocab_size).
+    """
+    # Direct attribute
+    if hasattr(config, "vocab_size") and config.vocab_size is not None:
+        return config.vocab_size
+
+    # Nested configs (MoE, encoder-decoder, etc.)
+    for attr in ("text_config", "decoder", "encoder", "config"):
+        nested = getattr(config, attr, None)
+        if nested is not None and hasattr(nested, "vocab_size"):
+            return nested.vocab_size
+
+    # Fallback: check if it's a dict-like config
+    if hasattr(config, "to_dict"):
+        d = config.to_dict()
+        for key in ("vocab_size", "text_config.vocab_size", "decoder.vocab_size", "encoder.vocab_size"):
+            val = d
+            for part in key.split("."):
+                val = val.get(part) if isinstance(val, dict) else None
+                if val is None:
+                    break
+            if val is not None:
+                return val
+
+    raise AttributeError(
+        f"Could not determine vocab_size from config of type {type(config).__name__}. "
+        "Please check the config structure manually."
+    )
+
+
+def get_hidden_size(config) -> int:
+    """Extract hidden size from various config types."""
+    for attr in ("hidden_size", "n_embd", "d_model", "d_embed"):
+        if hasattr(config, attr) and getattr(config, attr) is not None:
+            return getattr(config, attr)
+
+    for attr in ("text_config", "decoder", "encoder"):
+        nested = getattr(config, attr, None)
+        if nested is not None and hasattr(nested, "hidden_size"):
+            return nested.hidden_size
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -721,7 +775,7 @@ def main() -> None:
     print(f"Loading tokenizer from '{input_dir}'…")
     tokenizer = AutoTokenizer.from_pretrained(input_dir)
 
-    original_vocab_size = config.vocab_size
+    original_vocab_size = get_vocab_size(config)
 
     # ── 2. Validate token IDs ──────────────────────────────────────────────
     print(f"\nOriginal vocabulary size: {original_vocab_size}")
