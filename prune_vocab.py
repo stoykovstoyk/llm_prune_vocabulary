@@ -415,13 +415,17 @@ def rebuild_tokenizer_json(
         model["vocab"] = new_vocab
 
         # For BPE, filter merges that reference tokens no longer in the vocab
+        # or whose result token was removed.
         if model_type == "BPE" and "merges" in model:
             new_vocab_set = set(new_vocab.keys())
             filtered_merges = []
             for merge_str in model["merges"]:
                 parts = merge_str.split(" ", 1)
-                if len(parts) == 2 and parts[0] in new_vocab_set and parts[1] in new_vocab_set:
-                    filtered_merges.append(merge_str)
+                if len(parts) == 2:
+                    t1, t2 = parts
+                    result = t1 + t2
+                    if t1 in new_vocab_set and t2 in new_vocab_set and result in new_vocab_set:
+                        filtered_merges.append(merge_str)
             model["merges"] = filtered_merges
 
     elif model_type in ("Unigram", "SentencePiece"):
