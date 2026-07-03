@@ -646,8 +646,8 @@ def _copy_non_safetensors(input_dir: str, output_dir: str) -> None:
 
 
 def save_everything(
-    config,
     output_dir: str,
+    new_vocab_size: int,
     tokenizer_data: dict,
     tokenizer_config: dict,
     special_tokens_map: Optional[dict],
@@ -661,9 +661,16 @@ def save_everything(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Config (updated vocab_size)
+    # Config (updated vocab_size) — read the original JSON, patch, and write
+    # back so that model_type and all custom fields are preserved.
     print("  Saving config.json…")
-    config.save_pretrained(output_dir)
+    config_src = os.path.join(input_dir, "config.json")
+    with open(config_src, "r", encoding="utf-8") as f:
+        config_dict = json.load(f)
+    config_dict["vocab_size"] = new_vocab_size
+    config_dst = os.path.join(output_dir, "config.json")
+    with open(config_dst, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, ensure_ascii=False, indent=2)
 
     # tokenizer.json
     print("  Saving tokenizer.json…")
@@ -901,8 +908,8 @@ def main() -> None:
     # ── 7. Save everything ─────────────────────────────────────────────────
     print(f"Saving pruned model to '{output_dir}'…")
     save_everything(
-        config,
         output_dir,
+        new_vocab_size,
         new_tk_data,
         new_tk_cfg,
         stm_data,
