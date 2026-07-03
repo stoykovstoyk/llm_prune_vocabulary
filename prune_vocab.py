@@ -414,6 +414,16 @@ def rebuild_tokenizer_json(
                 new_vocab[token] = id_mapping[old_id]
         model["vocab"] = new_vocab
 
+        # For BPE, filter merges that reference tokens no longer in the vocab
+        if model_type == "BPE" and "merges" in model:
+            new_vocab_set = set(new_vocab.keys())
+            filtered_merges = []
+            for merge_str in model["merges"]:
+                parts = merge_str.split(" ", 1)
+                if len(parts) == 2 and parts[0] in new_vocab_set and parts[1] in new_vocab_set:
+                    filtered_merges.append(merge_str)
+            model["merges"] = filtered_merges
+
     elif model_type in ("Unigram", "SentencePiece"):
         # List-based vocabulary: [[token, score], ...] where index = ID
         old_vocab_list: List = model.get("vocab", [])
@@ -647,30 +657,18 @@ def _copy_non_safetensors(input_dir: str, output_dir: str) -> None:
 
 def save_everything(
     output_dir: str,
-    new_vocab_size: int,
     tokenizer_data: dict,
     tokenizer_config: dict,
     special_tokens_map: Optional[dict],
     input_dir: str,
 ) -> None:
-    """Write pruned model configuration, tokenizer, and supporting files.
+    """Write pruned tokenizer files to *output_dir*.
 
-    Safetensors weight files are already on disk (pruned in-place by
-    :func:`prune_safetensors_directory`).  This function writes the
-    remaining text-format files.
+    Safetensors weight files and config.json are already on disk
+    (pruned/saved in earlier steps).  This function writes the
+    tokenizer text-format files.
     """
     os.makedirs(output_dir, exist_ok=True)
-
-    # Config (updated vocab_size) — read the original JSON, patch, and write
-    # back so that model_type and all custom fields are preserved.
-    print("  Saving config.json…")
-    config_src = os.path.join(input_dir, "config.json")
-    with open(config_src, "r", encoding="utf-8") as f:
-        config_dict = json.load(f)
-    config_dict["vocab_size"] = new_vocab_size
-    config_dst = os.path.join(output_dir, "config.json")
-    with open(config_dst, "w", encoding="utf-8") as f:
-        json.dump(config_dict, f, ensure_ascii=False, indent=2)
 
     # tokenizer.json
     print("  Saving tokenizer.json…")
@@ -836,8 +834,15 @@ def main() -> None:
         id_mapping, new_vocab_size,
     )
 
-    # Update config
-    config.vocab_size = new_vocab_size
+    # Save config.json immediately (so it exists even if later steps fail)
+    print("  Saving config.json…")
+    config_src = os.path.join(input_dir, "config.json")
+    with open(config_src, "r", encoding="utf-8") as f:
+        config_dict = json.load(f)
+    config_dict["vocab_size"] = new_vocab_size
+    config_dst = os.path.join(output_dir, "config.json")
+    with open(config_dst, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, ensure_ascii=False, indent=2)
 
     # ── 5. Rebuild tokenizer files ────────────────────────────────────────
     print("Rebuilding tokenizer files…")
@@ -909,7 +914,6 @@ def main() -> None:
     print(f"Saving pruned model to '{output_dir}'…")
     save_everything(
         output_dir,
-        new_vocab_size,
         new_tk_data,
         new_tk_cfg,
         stm_data,
