@@ -32,7 +32,6 @@ import sys
 import tempfile
 from typing import Dict, List, Optional, Set
 
-import safetensors.torch  # noqa: F401  (ensures safetensors is importable)
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -608,6 +607,13 @@ def main() -> None:
     input_dir = args.model
     output_dir = args.output
     dry_run = args.dry_run
+
+    # Deferred import: safetensors is only needed for saving, not for --help
+    try:
+        import safetensors  # noqa: F401
+    except ImportError:
+        print("Error: safetensors is required. Install it with: pip install safetensors")
+        sys.exit(1)
 
     if not remove_ids:
         print("Error: --remove-ids is empty or contains no valid IDs.")

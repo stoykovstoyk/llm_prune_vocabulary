@@ -57,6 +57,14 @@ The script never retrains the tokenizer. Instead it rebuilds the `tokenizer.json
 
 These are the packages you would normally have in any HF model environment. CPU-only execution is fully supported.
 
+### Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
 ## Usage
 
 ### Basic
@@ -190,6 +198,7 @@ output_dir/
 | Invalid integer in `--remove-ids`         | `Error: 'abc' is not a valid integer token ID.`                |
 | ID out of range                           | `Error: token ID 99999 is out of range. Vocabulary size is ...`|
 | Special token in removal list             | `Error: special token 'bos_token_id' (ID 1) is marked for removal.` |
+| `safetensors` not installed               | `Error: safetensors is required. Install it with: pip install safetensors` |
 | `tokenizer.json` missing                  | `Error: tokenizer.json not found in model directory.`          |
 | Consistency check fails (embedding rows)  | `Consistency error: embedding rows ... != new vocabulary size ...` |
 | Consistency check fails (tokenizer load)  | `Error: rebuilt tokenizer could not be loaded: ...`            |

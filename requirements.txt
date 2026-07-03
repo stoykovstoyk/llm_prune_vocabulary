@@ -1,0 +1,8 @@
+# Install in a virtual environment to avoid system conflicts:
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install -r requirements.txt
+
+torch>=2.0.0
+transformers>=4.30.0
+safetensors>=0.4.0
