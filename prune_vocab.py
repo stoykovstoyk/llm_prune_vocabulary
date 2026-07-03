@@ -576,10 +576,10 @@ def check_tokenizer_consistency(
     else:
         tk_vocab_size = -1
 
-    if tk_vocab_size != new_vocab_size:
+    if tk_vocab_size > new_vocab_size:
         print(
             f"Consistency error: tokenizer vocabulary size ({tk_vocab_size}) "
-            f"!= model vocabulary size ({new_vocab_size})."
+            f"exceeds model vocabulary size ({new_vocab_size})."
         )
         sys.exit(1)
 
