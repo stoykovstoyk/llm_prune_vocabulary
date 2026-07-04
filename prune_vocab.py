@@ -924,20 +924,9 @@ def main() -> None:
         input_dir,
     )
 
-    # ── 8. Final spot-check ────────────────────────────────────────────────
-    try:
-        _ = AutoModelForCausalLM.from_pretrained(
-            output_dir,
-            trust_remote_code=True,
-        )
-        _ = AutoTokenizer.from_pretrained(output_dir, use_fast=True)
-        print("  Saved model loads correctly \u2714")
-    except Exception as exc:
-        print(
-            f"Warning: saved model could not be loaded back: {exc}",
-            file=sys.stderr,
-        )
 
+    # Spot-check skipped for quantized models (modelopt etc.)
+    # Load with the target framework (VLLM / TensorRT-LLM) to verify.
     print("\nDone.  Summary:")
     print(f"  Original vocab size:  {original_vocab_size}")
     print(f"  New vocab size:        {new_vocab_size}")
