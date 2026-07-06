@@ -283,12 +283,24 @@ def is_vocab_tensor(name: str, shape: torch.Size, vocab_size: int) -> bool:
 
     A tensor is considered vocab-mapped when:
     1. Its first dimension equals *vocab_size*, **and**
-    2. Its name contains a known embedding/lm-head keyword.
+    2. Its name matches a known embedding/lm-head pattern.
+
+    Matching uses both prefix-based (e.g. ``model.embed_tokens``) and
+    substring-based (e.g. ``embed_tokens.weight``) checks to accommodate
+    different model architectures (Qwen, Llama, GPT-2, etc.).
     """
     if len(shape) < 1 or shape[0] != vocab_size:
         return False
     lower = name.lower()
-    return any(lower.startswith(p.lower()) for p in _VOCAB_PREFIXES)
+    # Fast path: known prefix matches
+    if any(lower.startswith(p.lower()) for p in _VOCAB_PREFIXES):
+        return True
+    # Flexible match: any tensor ending with embed_tokens.weight
+    # or starting with lm_head is vocab-mapped.
+    # The shape[0] == vocab_size guard prevents false positives.
+    if lower.endswith("embed_tokens.weight"):
+        return True
+    return False
 
 
 def find_vocab_tensors(
