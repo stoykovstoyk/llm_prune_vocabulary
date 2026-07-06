@@ -60,8 +60,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--remove-ids",
-        required=True,
+        default="",
         help="Comma-separated list of token IDs to remove (e.g. '0,1,2').",
+    )
+    parser.add_argument(
+        "--remove-ids-file",
+        default="",
+        help="Path to a text file with one token ID per line to remove.",
     )
     parser.add_argument(
         "--dry-run",
@@ -763,6 +768,24 @@ def get_hidden_size(config) -> int:
 def main() -> None:
     args = parse_args()
     remove_ids = parse_remove_ids(args.remove_ids)
+    if args.remove_ids_file:
+        try:
+            with open(args.remove_ids_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        remove_ids.add(int(line))
+                    except ValueError:
+                        print(
+                            f"Error: '{line}' in --remove-ids-file is not a "
+                            "valid integer token ID.",
+                        )
+                        sys.exit(1)
+        except OSError as exc:
+            print(f"Error: cannot read --remove-ids-file: {exc}")
+            sys.exit(1)
     input_dir = args.model
     output_dir = args.output
     dry_run = args.dry_run
@@ -775,7 +798,10 @@ def main() -> None:
         sys.exit(1)
 
     if not remove_ids:
-        print("Error: --remove-ids is empty or contains no valid IDs.")
+        print(
+            "Error: no token IDs to remove. "
+            "Use --remove-ids or --remove-ids-file.",
+        )
         sys.exit(1)
 
     # ── 1. Load config & tokenizer (no model loading) ─────────────────────

@@ -102,6 +102,25 @@ python prune_vocab.py \
     --remove-ids 10,20,30,40,50
 ```
 
+### Text file (one ID per line)
+
+```bash
+python prune_vocab.py \
+    --model ./model \
+    --output ./model-pruned \
+    --remove-ids-file ids.txt
+```
+
+### Combined sources (IDs merged)
+
+```bash
+python prune_vocab.py \
+    --model ./model \
+    --output ./model-pruned \
+    --remove-ids "100001" \
+    --remove-ids-file more_ids.txt
+```
+
 ### Load the pruned model
 
 ```python
@@ -121,15 +140,18 @@ outputs = model.generate(**inputs)
 |-----------------------------|----------|------------------------------------------------------------------|
 | `--model`                   | Yes      | Path to the input Hugging Face model directory.                  |
 | `--output`                  | Yes      | Path where the pruned model will be saved.                       |
-| `--remove-ids`              | Yes      | Comma-separated list of token IDs to remove.                     |
+| `--remove-ids`              | No*      | Comma-separated list of token IDs to remove.                     |
+| `--remove-ids-file`         | No*      | Path to a text file with one token ID per line to remove.        |
 | `--dry-run`                 | No       | Validate everything and report changes without writing.          |
 | `--ignore-mismatched-sizes` | No       | Pass `ignore_mismatched_sizes=True` to `from_pretrained`. Use when loading quantized or custom models whose weight shapes differ from the architecture config. |
+
+\* At least one of `--remove-ids` or `--remove-ids-file` is required.
 
 ## Step-by-step
 
 1. **Load** — the model with `AutoModelForCausalLM.from_pretrained()` and its tokenizer with `AutoTokenizer.from_pretrained()`.
 
-2. **Validate** — every ID in `--remove-ids` is checked to be within `[0, vocab_size)`. The script exits immediately with a clear message if any ID is out of range, including special tokens (`bos_token_id`, `eos_token_id`, `pad_token_id`, `unk_token_id`, etc.).
+2. **Validate** — every ID from `--remove-ids` and/or `--remove-ids-file` is checked to be within `[0, vocab_size)`. The script exits immediately with a clear message if any ID is out of range, including special tokens (`bos_token_id`, `eos_token_id`, `pad_token_id`, `unk_token_id`, etc.).
 
 3. **Map** — a set of kept IDs is built (all IDs not in the removal list), and an `old_id → new_id` mapping assigns each kept token a new consecutive ID starting at zero.
 
@@ -196,7 +218,7 @@ output_dir/
 
 | Scenario                                  | Message                                                        |
 |-------------------------------------------|----------------------------------------------------------------|
-| Invalid integer in `--remove-ids`         | `Error: 'abc' is not a valid integer token ID.`                |
+| Invalid integer in `--remove-ids` / `--remove-ids-file` | `Error: 'abc' is not a valid integer token ID.`                |
 | ID out of range                           | `Error: token ID 99999 is out of range. Vocabulary size is ...`|
 | Special token in removal list             | `Error: special token 'bos_token_id' (ID 1) is marked for removal.` |
 | `safetensors` not installed               | `Error: safetensors is required. Install it with: pip install safetensors` |
