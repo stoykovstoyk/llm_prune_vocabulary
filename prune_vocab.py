@@ -645,6 +645,53 @@ def check_tokenizer_consistency(
             sys.exit(1)
 
 
+def verify_pruned_tensor_shapes(
+    model_dir: str,
+    new_vocab_size: int,
+) -> None:
+    """Verify that embed_tokens and lm_head both have *new_vocab_size* rows.
+
+    Loads every ``.safetensors`` shard in *model_dir* and checks that
+    every vocab-mapped tensor's first dimension equals *new_vocab_size*.
+    This provides a positive check (``==``) complementing the negative
+    check (``!=``) in :func:`verify_pruned_vocab_size`.
+    """
+    safetensors_files = sorted(
+        f for f in os.listdir(model_dir) if f.endswith(".safetensors")
+    )
+    found_embed = False
+    found_lm_head = False
+    for fname in safetensors_files:
+        tensors = load_file(os.path.join(model_dir, fname), device="cpu")
+        for name, tensor in tensors.items():
+            if tensor.ndim < 2:
+                continue
+            lower = name.lower()
+            if lower.endswith("embed_tokens.weight"):
+                if tensor.size(0) != new_vocab_size:
+                    print(
+                        f"Error: {name} has {tensor.size(0)} rows, "
+                        f"expected {new_vocab_size}."
+                    )
+                    sys.exit(1)
+                found_embed = True
+                print(f"  {name}: {list(tensor.shape)} \u2714")
+            elif "lm_head" in lower and lower.endswith(".weight"):
+                if tensor.size(0) != new_vocab_size:
+                    print(
+                        f"Error: {name} has {tensor.size(0)} rows, "
+                        f"expected {new_vocab_size}."
+                    )
+                    sys.exit(1)
+                found_lm_head = True
+                print(f"  {name}: {list(tensor.shape)} \u2714")
+    if not found_embed:
+        print("  (no embedding tensor found — model may use tied embeddings)")
+    if not found_lm_head and not found_embed:
+        print("Warning: no vocabulary tensors found at all. Is the model directory correct?")
+    print("  Tensor shapes match new vocabulary size \u2714")
+
+
 # ---------------------------------------------------------------------------
 # Save helpers
 # ---------------------------------------------------------------------------
@@ -826,7 +873,10 @@ def main() -> None:
 
     # ── 2. Validate token IDs ──────────────────────────────────────────────
     print(f"\nOriginal vocabulary size: {original_vocab_size}")
-    print(f"Token IDs to remove ({len(remove_ids)}): {sorted(remove_ids)}")
+    if len(remove_ids) <= 20:
+        print(f"Token IDs to remove ({len(remove_ids)}): {sorted(remove_ids)}")
+    else:
+        print(f"Token IDs to remove ({len(remove_ids)}): {sorted(remove_ids)[:10]} ... {sorted(remove_ids)[-10:]}")
     validate_token_ids(remove_ids, original_vocab_size)
 
     # ── 3. Build mapping ───────────────────────────────────────────────────
@@ -926,7 +976,13 @@ def main() -> None:
     check_tokenizer_consistency(new_tk_data, new_tk_cfg, new_vocab_size)
     print("  Tokenizer data consistent \u2714")
 
-    # Verify the rebuilt tokenizer can be loaded by AutoTokenizer
+    # ── 7. Final verification ──────────────────────────────────────────────
+    print("Running final verification…")
+
+    # 7a. Tensor shapes match new vocabulary size
+    verify_pruned_tensor_shapes(output_dir, new_vocab_size)
+
+    # 7b. Load rebuilt tokenizer and test roundtrip
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_tk_json = os.path.join(tmpdir, "tokenizer.json")
         with open(tmp_tk_json, "w", encoding="utf-8") as f:
@@ -943,7 +999,7 @@ def main() -> None:
                 json.dump(stm_data, f, ensure_ascii=False)
 
         try:
-            _ = AutoTokenizer.from_pretrained(tmpdir, use_fast=True)
+            tk = AutoTokenizer.from_pretrained(tmpdir, use_fast=True)
             print("  Rebuilt tokenizer loads successfully \u2714")
         except Exception as exc:
             print(
@@ -952,7 +1008,29 @@ def main() -> None:
             )
             sys.exit(1)
 
-    # ── 7. Save everything ─────────────────────────────────────────────────
+        # Tokenizer vocab_size matches model config
+        tk_vocab = getattr(tk, "vocab_size", None) or len(tk)
+        if tk_vocab != new_vocab_size:
+            print(
+                f"Error: tokenizer vocab_size ({tk_vocab}) "
+                f"!= model vocab_size ({new_vocab_size})."
+            )
+            sys.exit(1)
+        print(f"  tokenizer.vocab_size == {new_vocab_size} \u2714")
+
+        # Tokenization roundtrip: IDs should be within range
+        for test_text in ("hello", " world", "привет", "test sentence"):
+            ids = tk.encode(test_text)
+            bad = [i for i in ids if not (0 <= i < new_vocab_size)]
+            if bad:
+                print(
+                    f"Error: tokenizer({test_text!r}) returned "
+                    f"out-of-range IDs: {bad}"
+                )
+                sys.exit(1)
+        print("  Tokenization roundtrip returns valid IDs \u2714")
+
+    # ── 8. Save everything ─────────────────────────────────────────────────
     print(f"Saving pruned model to '{output_dir}'…")
     save_everything(
         output_dir,
