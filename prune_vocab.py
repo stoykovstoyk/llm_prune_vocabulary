@@ -1110,6 +1110,21 @@ def main() -> None:
         input_dir,
     )
 
+    # ── 9. Post-save sweep: no tensor should still use original vocab_size ─
+    print("Post-save sweep: checking for stray tensors with original vocab dimension…")
+    stray: List[str] = []
+    for fname in sorted(f for f in os.listdir(output_dir) if f.endswith(".safetensors")):
+        tensors = load_file(os.path.join(output_dir, fname), device="cpu")
+        for name, tensor in tensors.items():
+            if tensor.ndim >= 1 and tensor.size(0) == original_vocab_size:
+                stray.append(f"  {fname}:{name} {list(tensor.shape)}")
+    if stray:
+        print("Error: the following tensors still have first dim == original_vocab_size:")
+        for s in stray:
+            print(s)
+        sys.exit(1)
+    print("  All clear — no tensor retains the original vocab dimension \u2714")
+
 
     # Spot-check skipped for quantized models (modelopt etc.)
     # Load with the target framework (VLLM / TensorRT-LLM) to verify.
