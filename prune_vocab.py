@@ -645,51 +645,111 @@ def check_tokenizer_consistency(
             sys.exit(1)
 
 
-def verify_pruned_tensor_shapes(
-    model_dir: str,
+_DTYPE_BYTES = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.float8_e4m3fn: 1,
+    torch.float8_e5m2: 1,
+    torch.uint8: 1,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 4,
+    torch.int64: 8,
+}
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    """Return the number of bytes *tensor* occupies (numel × element size)."""
+    return tensor.numel() * _DTYPE_BYTES.get(tensor.dtype, 4)
+
+
+def audit_vocab_tensor_changes(
+    input_dir: str,
+    output_dir: str,
+    vocab_size: int,
     new_vocab_size: int,
 ) -> None:
-    """Verify that embed_tokens and lm_head both have *new_vocab_size* rows.
+    """Audit every tensor whose first dimension was originally *vocab_size*.
 
-    Loads every ``.safetensors`` shard in *model_dir* and checks that
-    every vocab-mapped tensor's first dimension equals *new_vocab_size*.
-    This provides a positive check (``==``) complementing the negative
-    check (``!=``) in :func:`verify_pruned_vocab_size`.
+    Scans all ``.safetensors`` shards in *input_dir* for tensors with
+    ``shape[0] == vocab_size``, then locates the corresponding tensor in
+    *output_dir*.  Prints a detailed table and overall savings summary.
+
+    Exits with an error if any such tensor was **not** resized to
+    *new_vocab_size*.
     """
-    safetensors_files = sorted(
-        f for f in os.listdir(model_dir) if f.endswith(".safetensors")
-    )
-    found_embed = False
-    found_lm_head = False
-    for fname in safetensors_files:
-        tensors = load_file(os.path.join(model_dir, fname), device="cpu")
-        for name, tensor in tensors.items():
-            if tensor.ndim < 2:
+    # ── Collect before/after info ──────────────────────────────────────
+    records: List[dict] = []
+
+    for fname in sorted(f for f in os.listdir(input_dir) if f.endswith(".safetensors")):
+        src_tensors = load_file(os.path.join(input_dir, fname), device="cpu")
+        for name, src_tensor in src_tensors.items():
+            if src_tensor.ndim < 1 or src_tensor.size(0) != vocab_size:
                 continue
-            lower = name.lower()
-            if lower.endswith("embed_tokens.weight"):
-                if tensor.size(0) != new_vocab_size:
-                    print(
-                        f"Error: {name} has {tensor.size(0)} rows, "
-                        f"expected {new_vocab_size}."
-                    )
-                    sys.exit(1)
-                found_embed = True
-                print(f"  {name}: {list(tensor.shape)} \u2714")
-            elif "lm_head" in lower and lower.endswith(".weight"):
-                if tensor.size(0) != new_vocab_size:
-                    print(
-                        f"Error: {name} has {tensor.size(0)} rows, "
-                        f"expected {new_vocab_size}."
-                    )
-                    sys.exit(1)
-                found_lm_head = True
-                print(f"  {name}: {list(tensor.shape)} \u2714")
-    if not found_embed:
-        print("  (no embedding tensor found — model may use tied embeddings)")
-    if not found_lm_head and not found_embed:
-        print("Warning: no vocabulary tensors found at all. Is the model directory correct?")
-    print("  Tensor shapes match new vocabulary size \u2714")
+            dst_tensor = None
+            out_path = os.path.join(output_dir, fname)
+            if os.path.exists(out_path):
+                dst_tensors = load_file(out_path, device="cpu")
+                dst_tensor = dst_tensors.get(name)
+            records.append({
+                "name": name,
+                "shard": fname,
+                "dtype": src_tensor.dtype,
+                "old_shape": list(src_tensor.shape),
+                "old_bytes": _tensor_bytes(src_tensor),
+                "new_shape": list(dst_tensor.shape) if dst_tensor is not None else None,
+                "new_bytes": _tensor_bytes(dst_tensor) if dst_tensor is not None else 0,
+            })
+
+    if not records:
+        print("  (no tensors with first dim == vocab_size found)")
+        return
+
+    # ── Print table ────────────────────────────────────────────────────
+    print(f"\n  {'Tensor':<56} {'Orig shape':<20} {'New shape':<20} {'Dtype':<14} {'Saved':>10}")
+    print(f"  {'-'*56} {'-'*20} {'-'*20} {'-'*14} {'-'*10}")
+
+    total_old = 0
+    total_new = 0
+    any_error = False
+
+    for r in records:
+        saved = r["old_bytes"] - r["new_bytes"]
+        total_old += r["old_bytes"]
+        total_new += r["new_bytes"]
+
+        new_shape_str = str(r["new_shape"]) if r["new_shape"] is not None else "MISSING"
+        name_short = f"{r['shard']}:{r['name']}" if len(r['name']) > 50 else r['name']
+        print(f"  {name_short:<56} {str(r['old_shape']):<20} {new_shape_str:<20} {str(r['dtype']):<14} {_fmt_bytes(saved):>10}")
+
+        if r["new_shape"] is None or r["new_shape"][0] != new_vocab_size:
+            any_error = True
+            print(
+                f"  \u2716 Error: {r['name']} has {r['new_shape'][0] if r['new_shape'] else '?'} "
+                f"rows, expected {new_vocab_size}",
+            )
+
+    # ── Totals ─────────────────────────────────────────────────────────
+    print(f"  {'-'*56} {'-'*20} {'-'*20} {'-'*14} {'-'*10}")
+    print(f"  {'TOTAL':<56} {_fmt_bytes(total_old):>20} {_fmt_bytes(total_new):>20} {'':<14} {_fmt_bytes(total_old - total_new):>10}")
+    savings_pct = 100.0 * (total_old - total_new) / total_old if total_old else 0
+    print(f"  Total checkpoint size before:  {_fmt_bytes(total_old, pad=10)}")
+    print(f"  Total checkpoint size after:   {_fmt_bytes(total_new, pad=10)}")
+    print(f"  Total bytes removed:           {_fmt_bytes(total_old - total_new, pad=10)}")
+    print(f"  Reduction:                     {savings_pct:.2f}%")
+
+    if any_error:
+        sys.exit(1)
+
+
+def _fmt_bytes(n: int, pad: int = 0) -> str:
+    """Format *n* bytes as a human-readable string (e.g. ``1.23 GiB``)."""
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024:
+            return f"{n:>{pad}.{2 if unit != 'B' else 0}f} {unit}" if pad else f"{n:.2f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.2f} PiB"
 
 
 # ---------------------------------------------------------------------------
@@ -979,8 +1039,10 @@ def main() -> None:
     # ── 7. Final verification ──────────────────────────────────────────────
     print("Running final verification…")
 
-    # 7a. Tensor shapes match new vocabulary size
-    verify_pruned_tensor_shapes(output_dir, new_vocab_size)
+    # 7a. Full audit of every vocab-indexed tensor
+    audit_vocab_tensor_changes(
+        input_dir, output_dir, original_vocab_size, new_vocab_size,
+    )
 
     # 7b. Load rebuilt tokenizer and test roundtrip
     with tempfile.TemporaryDirectory() as tmpdir:
