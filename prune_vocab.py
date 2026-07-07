@@ -1008,15 +1008,23 @@ def main() -> None:
             )
             sys.exit(1)
 
-        # Tokenizer vocab_size matches model config
+        # Tokenizer vocab_size must not exceed model vocab_size
+        # (it may be smaller if some model vocab slots are unused)
         tk_vocab = getattr(tk, "vocab_size", None) or len(tk)
-        if tk_vocab != new_vocab_size:
+        if tk_vocab > new_vocab_size:
             print(
                 f"Error: tokenizer vocab_size ({tk_vocab}) "
-                f"!= model vocab_size ({new_vocab_size})."
+                f"> model vocab_size ({new_vocab_size})."
             )
             sys.exit(1)
-        print(f"  tokenizer.vocab_size == {new_vocab_size} \u2714")
+        if tk_vocab < new_vocab_size:
+            print(
+                f"  tokenizer vocab_size ({tk_vocab}) < model "
+                f"vocab_size ({new_vocab_size}) "
+                f"({new_vocab_size - tk_vocab} unused slots) \u2714"
+            )
+        else:
+            print(f"  tokenizer.vocab_size == {new_vocab_size} \u2714")
 
         # Tokenization roundtrip: IDs should be within range
         for test_text in ("hello", " world", "привет", "test sentence"):
