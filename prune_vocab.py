@@ -19,7 +19,11 @@ Requirements
 Usage
 -----
 python prune_vocab.py --model <input_dir> --output <output_dir> \\
-                      --remove-ids <comma-separated IDs> [--dry-run]
+                       --remove-ids <comma-separated IDs> [--dry-run]
+
+Inspect tensors::
+
+    python prune_vocab.py --model <input_dir> --explain-tensors
 """
 
 from __future__ import annotations
@@ -55,7 +59,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        required=True,
         help="Path where the pruned model will be saved.",
     )
     parser.add_argument(
@@ -79,6 +82,12 @@ def parse_args() -> argparse.Namespace:
         help="Pass ``ignore_mismatched_sizes=True`` to ``from_pretrained``. "
         "Use when loading quantized or custom models whose weight shapes "
         "differ from the architecture config.",
+    )
+    parser.add_argument(
+        "--explain-tensors",
+        action="store_true",
+        help="Print detailed explanations of every tensor in the checkpoint.\n"
+        "Requires --model; --output and --remove-ids are ignored.",
     )
     return parser.parse_args()
 
@@ -880,6 +889,400 @@ def get_hidden_size(config) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Tensor explainer
+# ---------------------------------------------------------------------------
+
+
+class _TensorExplainer:
+    """Return annotation dicts explaining the role of each tensor pattern."""
+
+    @staticmethod
+    def _fmt_bytes(n: int) -> str:
+        for unit in ("B", "KiB", "MiB", "GiB"):
+            if abs(n) < 1024:
+                return f"{n:.2f} {unit}" if unit != "B" else f"{n} B"
+            n /= 1024
+        return f"{n:.2f} TiB"
+
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        import re
+        n = re.sub(r"layers\.\d+", "layers.N", name)
+        n = re.sub(r"experts\.\d+", "experts.E", n)
+        n = re.sub(r"blocks\.\d+", "blocks.N", n)
+        return n
+
+    @staticmethod
+    def _has_quant_suffix(name: str) -> bool:
+        return any(
+            name.endswith(s) for s in (
+                "_scale", "_scale_2", "input_scale",
+            )
+        )
+
+    @staticmethod
+    def classify(name: str, shape) -> dict:
+        lower = name.lower()
+
+        # ── Quantisation metadata ────────────────────────────────────────
+        if _TensorExplainer._has_quant_suffix(name):
+            sz = list(shape)
+            is_per_group = len(sz) >= 1 and sz[-1] <= 128 and sz[-1] > 1
+            return {
+                "category": "Quantisation metadata",
+                "purpose": (
+                    "NVFP4 scale factor per-group (weight_scale) or "
+                    "per-tensor (input_scale, weight_scale_2). "
+                    "Dequantises the packed 4-bit weights."
+                ),
+                "formula": "w_deq = w_packed * scale",
+                "used": "During dequantisation, before every matmul.",
+                "vocab_dep": "No. Scales are per-channel or per-tensor.",
+                "prunable": "Only if the associated weight is pruned.",
+                "affects": "Inference efficiency (quantisation params).",
+            }
+
+        # ── Embedding ────────────────────────────────────────────────────
+        if "embed_tokens" in lower or lower.endswith("wte.weight"):
+            return {
+                "category": "Embedding",
+                "purpose": (
+                    "Maps discrete token IDs to dense hidden vectors. "
+                    "Each row is the learned representation of one token."
+                ),
+                "formula": "x = Embedding[token_id]",
+                "used": "At the very start of every forward pass.",
+                "vocab_dep": "Yes. First dimension == vocab_size.",
+                "prunable": "Yes, by vocabulary pruning (removing token rows).",
+                "affects": "Model capacity (embedding dimension per token).",
+            }
+
+        # ── LM head ──────────────────────────────────────────────────────
+        if "lm_head" in lower and not _TensorExplainer._has_quant_suffix(name):
+            qs = ""
+            if shape and len(shape) >= 2 and shape[1] == 1024:
+                qs = " (NVFP4 packed: 2 values per byte, original dim 2048)"
+            return {
+                "category": "LM Head",
+                "purpose": (
+                    "Projects the final hidden state to vocabulary logits. "
+                    "Each row corresponds to one token's score."
+                ),
+                "formula": "logits = h * W_lm^T",
+                "used": "At the final layer to compute next-token logits.",
+                "vocab_dep": f"Yes. Shape[0] == vocab_size{qs}.",
+                "prunable": "Yes, by vocabulary pruning (removing token rows).",
+                "affects": "Model capacity (vocab projection size).",
+            }
+
+        # ── Self-attention ───────────────────────────────────────────────
+        if "self_attn" in lower:
+            sub = "Q" if "q_proj" in lower else "K" if "k_proj" in lower else "V" if "v_proj" in lower else "O" if "o_proj" in lower else "attention"
+            desc = {
+                "Q": ("Query", "Q = X W_q", "dot-product with K"),
+                "K": ("Key", "K = X W_k", "dot-product with Q"),
+                "V": ("Value", "V = X W_v", "weighted sum via attention scores"),
+                "O": ("Output", "O = Attn W_o", "project concatenated heads back"),
+            }.get(sub, ("attention", "standard attention", "attention mechanism"))
+            return {
+                "category": "Self-attention",
+                "purpose": f"Projects hidden states into {desc[0]} vectors.",
+                "formula": desc[1],
+                "used": f"Every forward pass. Used in {desc[2]}.",
+                "vocab_dep": "No. Shape is hidden_dim × head_dim.",
+                "prunable": "By attention-head pruning or layer removal.",
+                "affects": "Model capacity (more heads = more expressivity).",
+            }
+
+        if "self_attn" in lower and ("norm" in lower or "rms" in lower):
+            return {
+                "category": "Self-attention",
+                "purpose": "Normalises Q or K vectors before attention (RoPE prep).",
+                "formula": "Q = rms_norm(Q); K = rms_norm(K)",
+                "used": "Every forward pass, before RoPE.",
+                "vocab_dep": "No. Per-head scale.",
+                "prunable": "Only with associated attention head.",
+                "affects": "Inference stability, not capacity.",
+            }
+
+        # ── Linear attention ─────────────────────────────────────────────
+        if "linear_attn" in lower:
+            return {
+                "category": "Linear attention",
+                "purpose": (
+                    "Implements a linear attention variant "
+                    "(Mamba-2 / state-space dual form) projection."
+                ),
+                "formula": "SSM-based: y = SSM(x)",
+                "used": "Every forward pass on alternating layers.",
+                "vocab_dep": "No.",
+                "prunable": "By layer removal only.",
+                "affects": "Model capacity.",
+            }
+
+        # ── MoE Router ──────────────────────────────────────────────────
+        if "router" in lower or "gate.weight" in lower:
+            return {
+                "category": "MoE Router",
+                "purpose": (
+                    "Computes routing logits that determine which experts "
+                    "each token is dispatched to (top-k routing)."
+                ),
+                "formula": "routing_weights = softmax(x W_router)",
+                "used": "Every forward pass, before expert computation.",
+                "vocab_dep": "No. Shape is hidden_dim × num_experts.",
+                "prunable": "Can shrink with expert count reduction.",
+                "affects": "Routing policy; small fraction of total params.",
+            }
+
+        # ── MoE Expert (gate, up or down projection) ────────────────────
+        if "experts." in lower or "expert." in lower:
+            is_shared = "shared" in lower
+
+            # Fused gate+up projection (DeepSeek-style MoE)
+            if "gate_up_proj" in lower:
+                return {
+                    "category": "Shared Expert" if is_shared else "MoE Expert (fused Gate+Up)",
+                    "purpose": (
+                        "Fused gate and up projection in the SwiGLU FFN "
+                        "inside each expert. Combines both projections "
+                        "into one tensor for efficiency."
+                    ),
+                    "formula": "gate = silu(x W_gate); up = x W_up",
+                    "used": "Every forward pass (activated per routed token).",
+                    "vocab_dep": "No.",
+                    "prunable": "By expert pruning (removing entire expert).",
+                    "affects": "Model capacity.",
+                }
+
+            if "gate_proj" in lower:
+                return {
+                    "category": "Shared Expert" if is_shared else "MoE Expert Gate",
+                    "purpose": (
+                        "Gate projection in the SwiGLU FFN inside each "
+                        f"{'shared' if is_shared else 'routed'} expert."
+                    ),
+                    "formula": "gate = silu(x W_gate)",
+                    "used": "Every forward pass (activated per routed token).",
+                    "vocab_dep": "No.",
+                    "prunable": "By expert pruning (removing entire expert).",
+                    "affects": "Model capacity.",
+                }
+            if "up_proj" in lower:
+                return {
+                    "category": "Shared Expert" if is_shared else "MoE Expert Up",
+                    "purpose": (
+                        "Up projection in the SwiGLU FFN inside each "
+                        f"{'shared' if is_shared else 'routed'} expert."
+                    ),
+                    "formula": "up = x W_up",
+                    "used": "Every forward pass (activated per routed token).",
+                    "vocab_dep": "No.",
+                    "prunable": "By expert pruning (removing entire expert).",
+                    "affects": "Model capacity.",
+                }
+            if "down_proj" in lower:
+                return {
+                    "category": "Shared Expert" if is_shared else "MoE Expert Down",
+                    "purpose": (
+                        "Down projection in the SwiGLU FFN inside each "
+                        f"{'shared' if is_shared else 'routed'} expert. "
+                        "Combines gate*up back to hidden_dim."
+                    ),
+                    "formula": "down = (gate * up) W_down",
+                    "used": "Every forward pass (activated per routed token).",
+                    "vocab_dep": "No.",
+                    "prunable": "By expert pruning (removing entire expert).",
+                    "affects": "Model capacity.",
+                }
+            # Fallback for expert tensors that don't match known patterns
+            return {
+                "category": "MoE Expert",
+                "purpose": "Part of a MoE expert's computation.",
+                "formula": "varies",
+                "used": "Every forward pass when expert is activated.",
+                "vocab_dep": "No.",
+                "prunable": "By expert pruning.",
+                "affects": "Model capacity.",
+            }
+
+        # ── MLP (dense, non-expert) ──────────────────────────────────────
+        if "mlp" in lower or "fc" in lower:
+            return {
+                "category": "MLP",
+                "purpose": "Feed-forward network projection (up/down or FC1/FC2).",
+                "formula": "MLP(x) = down(silu(up(x)))",
+                "used": "Every forward pass after attention.",
+                "vocab_dep": "No.",
+                "prunable": "By layer removal or width reduction.",
+                "affects": "Model capacity.",
+            }
+
+        # ── Layer norms ──────────────────────────────────────────────────
+        if "norm" in lower and ("weight" in name or "bias" in name):
+            return {
+                "category": "Layer Norm",
+                "purpose": (
+                    "Element-wise scale (and bias) for layer normalisation. "
+                    "Stabilises training and inference."
+                ),
+                "formula": "y = gamma * (x - mean) / std + beta",
+                "used": "Every forward pass, before/after each sub-layer.",
+                "vocab_dep": "No. Shape is [hidden_dim].",
+                "prunable": "Only with associated hidden dim change.",
+                "affects": "Inference stability.",
+            }
+
+        # ── Vision encoder ──────────────────────────────────────────────
+        if "visual" in lower or "vision" in lower:
+            cat = "Vision encoder"
+            if "patch_embed" in lower:
+                purp = "Converts image patches into visual tokens."
+            elif "pos_embed" in lower:
+                purp = "Learned positional embedding for visual tokens."
+            elif "merger" in lower:
+                purp = "Projects visual tokens into language-model hidden space."
+            elif "attn" in lower or "attention" in lower:
+                purp = "Self-attention in the vision encoder."
+            elif "mlp" in lower or "fc" in lower:
+                purp = "Feed-forward network in the vision encoder."
+            elif "norm" in lower:
+                purp = "Layer norm in the vision encoder."
+            else:
+                purp = "Vision encoder component."
+            return {
+                "category": cat,
+                "purpose": purp,
+                "formula": "varies",
+                "used": "Only for vision inputs (multi-modal inference).",
+                "vocab_dep": "No.",
+                "prunable": "Only by removing the vision encoder entirely.",
+                "affects": "Model capacity (vision modality).",
+            }
+
+        # ── MTP (Multi-Token Prediction) ────────────────────────────────
+        if lower.startswith("mtp"):
+            return {
+                "category": "MTP",
+                "purpose": (
+                    "Multi-Token Prediction module. "
+                    "Predicts K future tokens in parallel at each position."
+                ),
+                "formula": "varies (transformer decoder + expert MoE)",
+                "used": "During training and speculative decoding.",
+                "vocab_dep": "No.",
+                "prunable": "Only by removing MTP module entirely.",
+                "affects": "Training efficiency / speculative decoding speed.",
+            }
+
+        # ── Fallback ─────────────────────────────────────────────────────
+        return {
+            "category": "Other",
+            "purpose": "Unknown or unclassified tensor.",
+            "formula": "—",
+            "used": "varies",
+            "vocab_dep": "Cannot determine.",
+            "prunable": "Unknown.",
+            "affects": "Unknown.",
+        }
+
+
+def explain_tensors(input_dir: str) -> None:
+    """Print a detailed explanation for every unique tensor pattern."""
+    import re
+    import safetensors
+
+    # ── Collect patterns ──────────────────────────────────────────────
+    groups: dict = {}
+    total_all = 0
+
+    safetensors_files = sorted(
+        f for f in os.listdir(input_dir) if f.endswith(".safetensors")
+    )
+    if not safetensors_files:
+        print("Error: no .safetensors files found.")
+        sys.exit(1)
+
+    for fname in safetensors_files:
+        with safetensors.safe_open(
+            os.path.join(input_dir, fname), framework="pt"
+        ) as f:
+            for name in f.keys():
+                shape = f.get_tensor(name).shape
+                t = f.get_tensor(name)
+                nbytes = t.numel() * t.element_size()
+                total_all += nbytes
+
+                norm = _TensorExplainer._norm_name(name)
+                # Count unique layers/experts in this group
+                m_layers = set(re.findall(r"layers\.(\d+)", name))
+                m_experts = set(re.findall(r"experts\.(\d+)", name))
+                m_blocks = set(re.findall(r"blocks\.(\d+)", name))
+
+                if norm not in groups:
+                    groups[norm] = {
+                        "example": name,
+                        "shape": list(shape),
+                        "dtype": str(t.dtype).split(".")[-1],
+                        "count": 0,
+                        "total_bytes": 0,
+                        "layers": set(),
+                        "experts": set(),
+                        "blocks": set(),
+                        "nbytes_single": nbytes,
+                    }
+                g = groups[norm]
+                g["count"] += 1
+                g["total_bytes"] += nbytes
+                g["layers"] |= m_layers
+                g["experts"] |= m_experts
+                g["blocks"] |= m_blocks
+
+    # ── Sort by total bytes descending ────────────────────────────────
+    sorted_groups = sorted(groups.items(), key=lambda kv: -kv[1]["total_bytes"])
+
+    # ── Print ─────────────────────────────────────────────────────────
+    for norm_name, g in sorted_groups:
+        ann = _TensorExplainer.classify(norm_name, g["shape"])
+
+        # Build a compact instance range string
+        ranges = []
+        if g["layers"]:
+            nums = sorted(int(x) for x in g["layers"])
+            ranges.append(f"layers {nums[0]}..{nums[-1]}")
+        if g["experts"]:
+            nums = sorted(int(x) for x in g["experts"])
+            ranges.append(f"experts {nums[0]}..{nums[-1]}")
+        if g["blocks"]:
+            nums = sorted(int(x) for x in g["blocks"])
+            ranges.append(f"blocks {nums[0]}..{nums[-1]}")
+
+        range_str = f"  ({', '.join(ranges)})" if ranges else ""
+        count_str = f"{g['count']} occurrences"
+        size_str = _TensorExplainer._fmt_bytes(g["total_bytes"])
+
+        print(f"\nTensor pattern:")
+        print(f"  {norm_name}  [{', '.join(str(d) for d in g['shape'])}]  {g['dtype']}")
+        print(f"  {count_str}, {size_str} total{range_str}")
+        w = g["nbytes_single"]
+        if g["count"] > 1:
+            print(f"  ({_TensorExplainer._fmt_bytes(w)} per instance)")
+
+        print(f"\n  Category:  {ann['category']}")
+        print(f"  Purpose:   {ann['purpose']}")
+        print(f"  Formula:   {ann['formula']}")
+        print(f"  Used:      {ann['used']}")
+        print(f"  Prunable:  {ann['prunable']}")
+        print(f"  Vocab dep: {ann['vocab_dep']}")
+        print(f"  Affects:   {ann['affects']}")
+        print(f"\n  {'─' * 60}")
+
+    print(f"\nTotal checkpoint size: {_TensorExplainer._fmt_bytes(total_all)}")
+    print(f"Unique tensor patterns: {len(groups)}")
+    print(f"Total tensors: {sum(g['count'] for _, g in sorted_groups)}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -908,6 +1311,17 @@ def main() -> None:
     input_dir = args.model
     output_dir = args.output
     dry_run = args.dry_run
+
+    # ── Explain-tensors mode ─────────────────────────────────────────────
+    if args.explain_tensors:
+        explain_tensors(input_dir)
+        return
+
+    # ── Validate required arguments ───────────────────────────────────────
+    if not args.output:
+        print("Error: --output is required (unless using --explain-tensors).")
+        sys.exit(1)
+    output_dir = args.output
 
     # Deferred import: safetensors is only needed for saving, not for --help
     try:

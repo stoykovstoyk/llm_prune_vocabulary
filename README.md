@@ -121,6 +121,20 @@ python prune_vocab.py \
     --remove-ids-file more_ids.txt
 ```
 
+### Inspect every tensor in the checkpoint
+
+```bash
+python prune_vocab.py \
+    --model ./model \
+    --explain-tensors
+```
+
+Prints a detailed explanation for every unique tensor pattern in the model:
+its shape, dtype, total size, category, mathematical purpose, formula,
+when it is used during inference, whether it depends on vocabulary size,
+whether it can be pruned, and whether it affects model capacity or only
+inference efficiency.  No model or tokenizer loading is required.
+
 ### Load the pruned model
 
 ```python
@@ -144,8 +158,9 @@ outputs = model.generate(**inputs)
 | `--remove-ids-file`         | No*      | Path to a text file with one token ID per line to remove.        |
 | `--dry-run`                 | No       | Validate everything and report changes without writing.          |
 | `--ignore-mismatched-sizes` | No       | Pass `ignore_mismatched_sizes=True` to `from_pretrained`. Use when loading quantized or custom models whose weight shapes differ from the architecture config. |
+| `--explain-tensors`         | No       | Print detailed explanations for every tensor pattern in the checkpoint. Requires only `--model`; skips all pruning logic. |
 
-\* At least one of `--remove-ids` or `--remove-ids-file` is required.
+\* At least one of `--remove-ids` or `--remove-ids-file` is required (unless using `--explain-tensors`).
 
 ## Step-by-step
 
